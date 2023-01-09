@@ -1,0 +1,241 @@
+nestedCV_glmnet <- function(train.ds = NULL, 
+                            confounding.factor = NULL,
+                            ncv_folds = c(5, 5),
+                            inner_selection_percent = 0.2,
+                            seed=NULL,
+                            verbose = FALSE)
+{
+        if(!is.null(seed))
+                set.seed(seed);
+        ##if()
+        # Define variable
+        Train_accu <- NULL
+        Test_accu <- NULL
+        tune_params <- list()
+        ptm <- proc.time()
+        if(verbose){cat("\nRunning nested cross-validation...\n")}
+        outer_folds <- caret::createFolds(train.ds[, ncol(train.ds)], ncv_folds[1], list = FALSE)
+        intergrated_pred = rep(0, nrow(train.ds));
+        for (i in 1:ncv_folds[1])
+        {
+                print(i)
+                inner_atts <- list()
+                inner_tune_params <- list();
+                
+                ##inner_test_acc_sum.mse = NULL;
+                if(verbose){cat("\n Create [",ncv_folds[2],"] inner folds of outer fold[",i,"]\n")}
+                inner_folds <- caret::createFolds(train.ds[, ncol(train.ds)][outer_folds!=i], ncv_folds[2], list = TRUE)
+                if(verbose){cat("\n Feature Selection and Parameter Tuning...\n")} 
+                
+                
+                outer_idx <- which(outer_folds!=i)
+                outer_train.data <- as.matrix(train.ds[outer_idx, -ncol(train.ds)])
+                outer_test.data  <- as.matrix(train.ds[-outer_idx, -ncol(train.ds)])
+                outer_train.cf <- confounding.factor[outer_idx,];
+                outer_test.cf <- confounding.factor[-outer_idx,];
+                outer_train.pheno <- train.ds[outer_idx, ncol(train.ds)]
+                outer_test.pheno <- train.ds[-outer_idx, ncol(train.ds)]
+                
+                ##ranked_vars.train = apply(outer_train.data, 2, function(x){cor.test(x, outer_train.pheno)$p.value})
+                ranked_vars.train = abs(array(cor(outer_train.data, outer_train.pheno)))
+                names(ranked_vars.train) = colnames(train.ds)[-ncol(train.ds)];
+                ranked_vars.train[is.na(ranked_vars.train)] = 0;
+                wrapper.topN <- inner_selection_percent*length(ranked_vars.train)
+                ##if(wrapper.topN > sum(ranked_vars.train < 0.05) && sum(ranked_vars.train < 0.05) > 2)
+                ##{
+                ##  top_vars.train <- names(ranked_vars.train[ranked_vars.train < 0.05])
+                ##} else {
+                ##  top_vars.train <- names(sort(ranked_vars.train, decreasing = FALSE))[1:wrapper.topN]
+                ##}
+                ##top_vars.train <- names(ranked_vars.train[ranked_vars.train < 0.05])
+                top_vars.train <- names(sort(ranked_vars.train, decreasing = TRUE))[1:wrapper.topN]
+                
+                glmnet.obj <- glmnet(x = outer_train.data[, top_vars.train], y = outer_train.pheno)
+                lambda = glmnet.obj$lambda;
+                inner_test_acc_sum = array(0, c(length(lambda), ncv_folds[2]));
+                
+                
+                for (j in 1:length(inner_folds)){
+                        inner_idx <- which(outer_folds!=i)[-inner_folds[[j]]]
+                        inner_idx_test <- which(outer_folds!=i)[inner_folds[[j]]]
+                        ##ranked_vars = unlist(sapply(1:(ncol(train.ds)-1), function(x){cor.test(train.ds[inner_idx,x], train.ds[inner_idx,ncol(train.ds)])$p.value}))
+                        ##ranked_vars = apply(train.ds[inner_idx,-ncol(train.ds)], 2, function(x){cor.test(x, train.ds[inner_idx,ncol(train.ds)])$p.value})
+                        ranked_vars = abs(array(cor(train.ds[inner_idx,-ncol(train.ds)], train.ds[inner_idx,ncol(train.ds)])));
+                        names(ranked_vars) = colnames(train.ds)[-ncol(train.ds)];
+                        ranked_vars[is.na(ranked_vars)] = 0;
+                        wrapper.topN <- inner_selection_percent*length(ranked_vars)
+                        ##if(wrapper.topN > sum(ranked_vars < 0.05) && sum(ranked_vars < 0.05) > 2)
+                        ##{
+                        ##  top_vars <- names(ranked_vars[ranked_vars < 0.05])
+                        ##} else {
+                        ##  top_vars <- names(sort(ranked_vars, decreasing = FALSE))[1:wrapper.topN]
+                        ##}
+                        top_vars <- names(sort(ranked_vars, decreasing = TRUE))[1:wrapper.topN]
+                        
+                        inner_trn.data <- as.matrix(train.ds[inner_idx, top_vars])
+                        inner_tst.data <- as.matrix(train.ds[inner_idx_test, top_vars])
+                        inner_trn.cf <- confounding.factor[inner_idx,];
+                        inner_tst.cf <- confounding.factor[inner_idx_test,];
+                        inner_trn.pheno <- train.ds[, ncol(train.ds)][inner_idx]
+                        inner_tst.pheno <- train.ds[, ncol(train.ds)][inner_idx_test]
+                        
+                        inner_train_model <- glmnet(x = cbind(inner_trn.data, inner_trn.cf), y = inner_trn.pheno, lambda = lambda)
+                        
+                        ##inner_train_pred <- stats::predict(inner_train_model, inner_trn.data)
+                        ##inner_train_acc <- stats::cor(inner_trn.pheno, inner_train_pred)^2
+                        
+                        inner_test_pred <- stats::predict(inner_train_model, cbind(inner_tst.data, inner_tst.cf))
+                        ##inner_test_acc <- unlist(sapply(1:ncol(inner_test_pred), function(x){cor.test(inner_tst.pheno, inner_test_pred[,x], method="spearman")$estimate}))
+                        inner_test_acc <- array(cor(inner_tst.pheno, inner_test_pred))
+                        inner_test_acc[is.na(inner_test_acc)] = -1;
+                        inner_test_acc.mse <- apply(inner_test_pred, 2, function(x){mean((inner_tst.pheno - x)^2)})
+                        
+                        
+                        # store tuned parameters
+                        ##inner_accu <- abs(inner_train_acc-inner_test_acc)
+                        inner_tune_params[[j]] = data.frame(inner_train_model$lambda, inner_test_acc)
+                        inner_test_acc_sum[,j] = inner_test_acc;
+                        ##inner_test_acc_sum = cbind(inner_test_acc_sum, inner_test_acc);
+                        ##inner_test_acc_sum.mse = cbind(inner_test_acc_sum, inner_test_acc.mse);
+                        #store features
+                        inner_atts[[j]] <- top_vars
+                        ##print(j)
+                }
+                
+                outer_train.data = outer_train.data[, top_vars.train];
+                outer_test.data = outer_test.data[, top_vars.train];
+                acc.all = apply(inner_test_acc_sum, 1, sum)
+                lambda.min = inner_tune_params[[1]]$inner_train_model.lambda[which(acc.all == max(acc.all, na.rm = TRUE))]
+                ##if(length(lambda.min) > 1)
+                ##{
+                ##acc.all.mse = apply(inner_test_acc_sum.mse, 1, sum)
+                ##lambda.index = match(lambda.min, inner_tune_params[[1]]$inner_train_model.lambda);
+                ##lambda.min = inner_tune_params[[1]]$inner_train_model.lambda[which(acc.all.mse == min(acc.all.mse[lambda.index], na.rm = TRUE))];
+                
+                ##}
+                
+                outer_glmnet.model <- glmnet(cbind(outer_train.data, outer_train.cf), outer_train.pheno, lambda = lambda.min) 
+                outer_test.pred <- stats::predict(outer_glmnet.model, cbind(outer_test.data, outer_test.cf), s = lambda.min)
+                if(length(lambda.min) > 1)
+                        outer_test.pred = apply(outer_test.pred, 1, mean);
+                outer_test_acc <- cor.test(outer_test.pheno, outer_test.pred, method="spearman")$estimate
+                
+                intergrated_pred[-outer_idx] = outer_test.pred;
+                # store tuned parameters
+                ##outer_accu <- abs(outer_Train_accu-outer_Test_accu)
+                tune_params[[i]] = list(outer_test_acc, lambda.min, outer_glmnet.model$beta, top_vars.train, outer_test.pred);
+                names(tune_params[[i]]) = c("accuracy", "lambda", "feature.weight", "feature", "prediction")
+        }
+        
+        names(tune_params) = paste0(rep("fold", ncv_folds[1]), 1:ncv_folds[1]);
+        intergrated_acc = cor.test(train.ds[,ncol(train.ds)], intergrated_pred, method="spearman")$estimate
+        elapsed.time <- (proc.time() - ptm)[3]
+        if(verbose){cat("nestedCV elapsed time", elapsed.time, "\n")}
+        
+        return(list(intergrated_acc, tune_params));
+}
+
+
+CV_prediction_main <- function(expression.feature, 
+                               expression.target,
+                               confounding.factor,
+                               ncv_folds = c(5, 5),
+                               inner_selection_percent = 0.2,
+                               seed=NULL,
+                               iteration=1,
+                               verbose = FALSE)
+{
+        if(ncol(expression.feature) != ncol(expression.target))
+                stop("The sample sizes are not matched between the two datasets");
+        
+        
+        average.acc = array(0, c(iteration, nrow(expression.target)))
+        params = list();
+        for(iter in 1:iteration)
+        {
+                temp2 = list();
+                res = rep(0, nrow(expression.target));
+                for(i in 1:nrow(expression.target))
+                {
+                        train.ds = t(rbind(expression.feature, expression.target[i,]))
+                        temp = nestedCV_glmnet(train.ds = train.ds,confounding.factor=confounding.factor, ncv_folds = c(5, 5), inner_selection_percent = 0.2, seed=iter,verbose = TRUE);
+                        res[i] = temp[[1]];
+                        temp2[[i]] = temp[[2]]
+                        message(sprintf("Finished the prediction for %dth gene!", i));
+                }
+                names(temp2) = rownames(expression.target)
+                average.acc[iter,] = res;
+                params[[iter]] = temp2;
+                message(sprintf("Finished the %dth iteration!", iter));
+        }
+        
+        names(params) = paste0(rep("interation", iteration), 1:iteration)
+        out.res = list(average.acc, params)
+        names(out.res) = c("accuracy", "parameters")
+        
+        return(out.res);
+}
+
+## check slurm job status
+check_job_status <- function(job) 
+{
+        status = "pending";
+        queue_info <- system(paste("squeue -n", job$jobname), intern = TRUE);
+        if(length(queue_info) == 1)
+        {  status = "done"; } else {
+                st_temp = NULL;
+                for(i in 2:length(queue_info))
+                {
+                        st_temp = c(st_temp, scan(text=queue_info[i], what="character", quiet=TRUE)[5]);
+                }
+                if(sum(st_temp == "R") > 0)
+                        status="running";
+        }
+        return(status);
+} 
+
+CV_prediction_main_parallel <- function(gene_index)
+{
+        i = gene_index;
+        average.acc = rep(0, iteration);
+        params = list();
+        for(iter in 1:iteration)
+        {
+                train.ds = t(rbind(expression.feature, expression.target[i,]))
+                temp = nestedCV_glmnet(train.ds = train.ds, confounding.factor=confounding.factor, ncv_folds = ncv_folds, inner_selection_percent = inner_selection_percent, seed=iter,verbose = verbose);
+                average.acc[iter] = temp[[1]]
+                params[[iter]] = temp[[2]];
+        }
+        names(params) = paste0(rep("interation", iteration), 1:iteration)
+        
+        return(list(average.acc, params, i));
+}
+
+CV.glmnet.main <- function(gene.index.vector, filename, time='2:00:00', mem='50g', nodes=2)
+{
+        ##vec = data.frame(1:nrow(gene.exp.tumor))
+        vec = data.frame(gene.index.vector)
+        names(vec)= "gene_index";
+        obj = c("expression.feature", "expression.target", "confounding.factor", "ncv_folds","inner_selection_percent", "seed", "iteration", "verbose","nestedCV_glmnet");
+        sopt <- list(time = time,  mem = mem)
+        sjob <- slurm_apply(CV_prediction_main_parallel, vec, jobname = sprintf("%s.prediction", filename), add_objects = obj ,nodes = nodes, cpus_per_node = 2, slurm_options = sopt, submit = TRUE);
+        while(check_job_status(sjob) != "done")
+        {
+                Sys.sleep(120)
+        }
+        message("Prediction is done!");
+        res <- get_slurm_out(sjob, outtype = 'table')
+        saveRDS(res, sprintf("%s.res.rds", filename));
+        
+        acc_cor = array(0, c(dim(res)[1], length(res$V1[[1]])))
+        for(i in 1:dim(res)[1])
+        {
+                acc_cor[i,] = res$V1[[i]];
+        }
+        index = unlist(res$V3);
+        acc_cor = acc_cor[order(index),];
+        ##rownames(acc_cor) = rownames(expression.target)[index[order(index)]];
+        
+        return(acc_cor)
+}
+
